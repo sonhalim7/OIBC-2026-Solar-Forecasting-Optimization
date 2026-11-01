@@ -1,5 +1,5 @@
 """
-OIBC 2026  W 테스터 + 파이프라인 (v4)
+OIBC 2026  W 테스터 + 파이프라인 (v5)
 
 ■ 목적함수 (온라인 설명회 슬라이드 기준)
     W = Σ_t SMP_t · k_t · |Ŷ(g,t) − A(g,t)|    (G1, G2 각각 '집합 합계'로 계산 후 합산, 집합 간 상쇄 없음)
@@ -24,6 +24,13 @@ OIBC 2026  W 테스터 + 파이프라인 (v4)
     year_grid([(2021, 2022), (2022, 2023), (2023, 2024)])
     make_submission(); check_submission()
 
+■ v5 변경점 (규정 점검 반영)
+    - 결측 대체(중앙값)를 '학습 구간 통계'로만 계산 → 평가 구간 전체 통계 사용 제거
+    - 예보 결측 보간을 '과거 방향(ffill)'으로만 수행 → 미래 시각 값으로 채우지 않음
+    - 평가(예측) 프레임에는 SMP(_w)를 붙이지 않음 (SMP는 학습 가중치/채점에서만 사용)
+    - 패키지 자동 설치는 기본 OFF (환경변수 OIBC_AUTO_INSTALL=1 일 때만 동작)
+    - LightGBM 재현성 설정(deterministic, n_jobs 고정), 제출 시 out/environment.txt 기록
+
 ■ 데이터 폴더 구조 (슬라이드 기준)
     data/sites.csv, data/smp.csv
     data/train/{generation, forecast_wa, forecast_wb, observed_wa, observed_wb}.parquet, data/train/smp.csv
@@ -39,7 +46,8 @@ import sys
 from importlib import metadata
 
 # ----------------------------------------------------------------------
-# [자동 설치] 필요한 패키지가 없거나 버전이 다르면 실행 시 자동으로 pip install
+# [자동 설치] 기본 OFF. 재현 환경을 바꾸지 않기 위해 requirements.txt 로 설치하는 것을 권장.
+#   Colab 등에서 편의상 필요하면 실행 전에  OIBC_AUTO_INSTALL=1  환경변수를 설정.
 #   (모듈 이름, pip 패키지 이름, 고정 버전 또는 None)
 # ----------------------------------------------------------------------
 REQUIRED = [
@@ -74,7 +82,8 @@ def _ensure_packages():
     print("[auto-install] 완료")
 
 
-_ensure_packages()
+if os.environ.get("OIBC_AUTO_INSTALL") == "1":
+    _ensure_packages()
 import warnings
 warnings.filterwarnings("ignore", message="X does not have valid feature names, but LGBMRegressor was fitted with feature names")
 import numpy as np
@@ -122,6 +131,7 @@ CFG = dict(
         team=dict(objective="regression_l1", weight=True),     # 팀 모델: L1 + (SMP·k) 가중
     ),
     n_estimators=400,
+    n_jobs=4,                   # 스레드 수 고정 (재현성). 환경에 맞게 바꿔도 deterministic=True 라 결과는 같아야 함
     backend="lightgbm",         # lightgbm 이 오류나면 "sklearn" (느리지만 안전)
     cv_folds=3,                 # 주(week) 블록 교차검증 → OOF 오차로 구성 최적화
     opt_iters=200_000,
@@ -341,8 +351,13 @@ def solar_features(ts, lat, lon):
     }, index=ts.index)
 
 
-def fc_features(fc, vars_, prov, hours, stations):
-    """제공사 1개: 라운드 평균(avg) + 라운드 차이(d, 예보 변동성). 제공사끼리는 섞지 않음(단위계 상이)"""
+def fc_features(fc, vars_, prov, hours, stations, med=None):
+    """제공사 1개: 라운드 평균(avg) + 라운드 차이(d, 예보 변동성). 제공사끼리는 섞지 않음(단위계 상이)
+    결측 처리는 평가 구간 전체 통계/미래 시각 값을 쓰지 않는다:
+      - 라운드 간 대체(같은 시각의 다른 라운드 예보)
+      - 같은 지점의 '과거' 값으로 최대 6행 ffill
+      - 남은 결측은 학습 구간 중앙값(med). med=None 이면 이 호출 자체가 학습 프레임이므로 여기서 계산해 반환
+    반환: (피처 DataFrame, 중앙값 Series)"""
     d = fc[fc[C["st"]].isin(stations) & fc[C["ts"]].isin(hours)]
     g = d.groupby([C["st"], C["ts"], "_r"])[vars_].mean()
     found = set(g.index.get_level_values(0))
@@ -354,13 +369,20 @@ def fc_features(fc, vars_, prov, hours, stations):
     a = g.xs(rounds[0], level="_r").reindex(idx)
     b = g.xs(rounds[-1], level="_r").reindex(idx) if len(rounds) > 1 else a
     a, b = a.fillna(b), b.fillna(a)                 # 결손: 다른 라운드로 대체 (행 제외 금지)
-    out = pd.concat([((a + b) / 2).add_suffix(f"__{prov}_avg"), (b - a).add_suffix(f"__{prov}_d")], axis=1)
-    out = out.groupby(level=0).transform(lambda s: s.interpolate(limit=6, limit_direction="both"))
-    return out.fillna(out.median()).astype("float32")
+    out = pd.concat([((a + b) / 2).add_suffix(f"__{prov}_avg"), (b - a).add_suffix(f"__{prov}_d"), (b - a).abs().add_suffix(f"__{prov}_absd"),b.add_suffix(f"__{prov}_last")], axis=1)
+    out = out.groupby(level=0).ffill(limit=6)       # 과거 방향으로만 채움 (미래 값 사용 안 함)
+    if med is None:
+        m = out.median()
+    else:
+        m = med.reindex(out.columns)
+    return out.fillna(m).astype("float32"), m
 
 
-def make_frame(base, fcs):
-    """base: [site, ts(, generation)] → 낮 시간(cosz>0) 행에 피처 부착. '_row' = base 내 위치"""
+def make_frame(base, fcs, med=None, with_w=True):
+    """base: [site, ts(, generation)] → 낮 시간(cosz>0) 행에 피처 부착. '_row' = base 내 위치
+    med    : 결측 대체용 중앙값(Series). None 이면 학습 프레임으로 보고 base 에서 계산 → 결과의 .attrs["med"] 에 저장.
+             평가/제출 프레임은 반드시 학습 프레임의 .attrs["med"] 를 넘길 것 (평가 구간 통계 사용 금지).
+    with_w : 학습 가중치용 SMP×k(_w) 부착 여부. 평가(예측) 프레임은 False → 예측 경로에 SMP 가 들어가지 않음."""
     D = load_data()
     sites = D["sites"]
     b = base.reset_index(drop=True).merge(
@@ -370,18 +392,24 @@ def make_frame(base, fcs):
     b["_row"] = np.arange(len(b))
     day = b[b["cosz"] > 0.0].copy()
     hours = pd.DatetimeIndex(np.sort(day[C["ts"]].unique()))
-    feats = []
+    feats, meds = [], []
     for prov, key in (("A", C["wa"]), ("B", C["wb"])):
         fc, vars_ = fcs[prov]
-        w = fc_features(fc, vars_, prov, hours, sorted(day[key].unique()))
+        w, m = fc_features(fc, vars_, prov, hours, sorted(day[key].unique()), med)
         w.index.names = [key, C["ts"]]
         day = day.merge(w.reset_index(), on=[key, C["ts"]], how="left")
         feats += list(w.columns)
-    day[feats] = day[feats].fillna(day[feats].median())
-    wt = D["wtab"]["w"]
-    day["_w"] = day[C["ts"]].map(wt).fillna(wt.median()).astype("float32")
+        meds.append(m)
+    med_all = pd.concat(meds) if med is None else med
+    day[feats] = day[feats].fillna(med_all.reindex(feats))
+    if with_w:                                       # 학습 프레임 전용
+        wt = D["wtab"]["w"]
+        ww = day[C["ts"]].map(wt)
+        day["_w"] = ww.fillna(ww.median()).astype("float32")
     base_feats = ["cosz", "etr", "ha", "doy_sin", "doy_cos", "hour", C["lat"], C["lon"], "cap_"]
-    return day.reset_index(drop=True), base_feats + feats
+    out = day.reset_index(drop=True)
+    out.attrs["med"] = med_all
+    return out, base_feats + feats
 
 
 # ----------------------------------------------------------------------
@@ -394,7 +422,8 @@ def make_model(seed, objective):
         import lightgbm as lgb
         return lgb.LGBMRegressor(objective=objective, n_estimators=CFG["n_estimators"], learning_rate=0.06,
                                  num_leaves=63, subsample=0.8, subsample_freq=1, colsample_bytree=0.7,
-                                 min_child_samples=100, random_state=seed, verbose=-1)
+                                 min_child_samples=100, random_state=seed, verbose=-1,
+                                 n_jobs=CFG["n_jobs"], deterministic=True, force_row_wise=True)
     except ImportError:
         from sklearn.ensemble import HistGradientBoostingRegressor
         loss = "absolute_error" if objective in ("regression_l1", "l1") else "squared_error"
@@ -545,7 +574,8 @@ def err_matrix(tr, err, sites, wtab):
     si = pd.Series(np.arange(len(sites)), index=sites[C["site"]].values)[tr[C["site"]]].values
     E = np.zeros((len(sites), len(hours)), dtype="float32")
     E[si, ti] = err
-    w = wtab["w"].reindex(hours).fillna(wtab["w"].median()).values.astype("float64")
+    w = wtab["w"].reindex(hours)
+    w = w.fillna(w.median()).values.astype("float64")      # 결측 대체는 학습 시각들의 중앙값
     return E, w
 
 
@@ -615,7 +645,7 @@ def tester(fit_years, eval_years, start_month=None, seeds=None, verbose=True):
     print("  피처 생성...")
     tr_all, feats = make_frame(base_fit, D["fc"])
     tr = prep_train(tr_all)
-    ev, _ = make_frame(base_ev, D["fc"])
+    ev, _ = make_frame(base_ev, D["fc"], med=tr_all.attrs["med"], with_w=False)
 
     # --- OOF 오차 → 구성 최적화 (fit 연도 안에서만)
     print("  OOF 오차 계산 (팀 모델)...")
@@ -692,7 +722,7 @@ def make_submission(seeds=(0, 1, 2)):
     fcT = {"A": load_fc(CFG["files"]["test_fc_a"], flat_ok=False), "B": load_fc(CFG["files"]["test_fc_b"], flat_ok=False)}
     grid = pd.MultiIndex.from_product([sites[C["site"]].values, eval_hours],
                                       names=[C["site"], C["ts"]]).to_frame(index=False)
-    ev, _ = make_frame(grid, fcT)
+    ev, _ = make_frame(grid, fcT, med=tr_all.attrs["med"], with_w=False)
     p = np.mean([fit_predict(tr, ev, feats, CFG["models"]["team"], seed=s) for s in seeds], axis=0)
     full = np.zeros(len(grid))
     full[ev["_row"].values] = p
@@ -708,7 +738,26 @@ def make_submission(seeds=(0, 1, 2)):
     comp.to_csv(os.path.join(CFG["out_dir"], "composition.csv"), index=False)
     agg.to_csv(os.path.join(CFG["out_dir"], "forecast.csv"), index=False)
     print(f"저장 완료 → {CFG['out_dir']}/composition.csv, forecast.csv")
+    write_env_report()
     return check_submission()
+
+
+def write_env_report(path=None):
+    """재현용 환경 기록: Python/패키지 버전 + 핵심 설정 → out/environment.txt"""
+    path = path or os.path.join(CFG["out_dir"], "environment.txt")
+    lines = [f"python {sys.version.split()[0]}"]
+    for _, pkg, _v in REQUIRED:
+        try:
+            lines.append(f"{pkg}=={metadata.version(pkg)}")
+        except metadata.PackageNotFoundError:
+            lines.append(f"{pkg} (not installed)")
+    keep = ("data_dir", "start_month", "n_estimators", "n_jobs", "backend", "cv_folds", "opt_iters", "seeds",
+            "submit_train_from", "min_cap_kw")
+    lines += [f"CFG.{k}={CFG[k]}" for k in keep]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"환경 기록 → {path}")
 
 
 def check_submission(comp_path=None, fc_path=None):
